@@ -1,0 +1,11 @@
+{
+"resolution" : 1.5,
+"length" : 200,
+"diameter" : 64,
+"radius" : 0.45,
+"inlet_buffer_cells": 12,
+"outlet_buffer_cells" : 16,
+"gyroid_period" : 0.25,
+"gyroid_level" : 0.0,
+"gyroid_solid_side" : "positive"
+}

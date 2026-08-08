@@ -319,6 +319,54 @@ def guo_force_term(
         * force_kernel
     )
 
+def precompute_bfl_auxiliary(
+    solid: Array,
+) -> Array:
+    """
+    Precompute whether the second fluid node required by
+    the BFL q < 0.5 branch exists.
+
+    Returns
+    -------
+    Array
+        Boolean array with shape
+        (19, nx, ny, nz).
+    """
+
+    fluid = ~solid
+
+    masks = []
+
+    for shift in C_SHIFTS:
+        away_shift = tuple(
+            -component
+            for component in shift
+        )
+
+        second_node_is_fluid = (
+            pull_shift_no_wrap(
+                fluid,
+                away_shift,
+                fill_value=False,
+            )
+        )
+
+        second_node_is_valid = (
+            valid_source_mask(
+                solid.shape,
+                away_shift,
+            )
+        )
+
+        masks.append(
+            second_node_is_fluid
+            & second_node_is_valid
+        )
+
+    return jnp.stack(
+        masks,
+        axis=0,
+    )
 
 def precompute_link_geometry(
     solid: Array,
@@ -452,6 +500,7 @@ def pull_stream_and_bounce(
     post_collision: Array,
     source_solid: Array,
     wall_fraction: Array,
+    second_fluid_available: Array,
     solid: Array,
     *,
     inlet_velocity: float,
@@ -460,16 +509,50 @@ def pull_stream_and_bounce(
     """
     Non-periodic pull streaming with BFL linear interpolated bounce-back.
 
-    For a wall link, q is the fraction of the link from the destination fluid
-    node towards the source solid node. If the second fluid node required by
-    the q < 0.5 branch is unavailable, the code safely falls back to ordinary
-    halfway bounce-back for that link.
+    Parameters
+    ----------
+    post_collision:
+        Post-collision distributions with shape
+        (19, nx, ny, nz).
+
+    source_solid:
+        Boolean fluid-to-solid link mask with shape
+        (19, nx, ny, nz).
+
+    wall_fraction:
+        BFL wall position q for every lattice link, shape
+        (19, nx, ny, nz).
+
+    second_fluid_available:
+        Precomputed Boolean mask with shape
+        (19, nx, ny, nz).
+
+        True where the second fluid node required for the
+        q < 0.5 BFL branch exists and is valid.
+
+    solid:
+        Boolean solid mask with shape
+        (nx, ny, nz).
+
+    inlet_velocity:
+        Prescribed axial inlet velocity.
+
+    inlet_density:
+        Fixed outlet/reference density.
     """
 
     streamed_directions = []
 
-    for direction, shift in enumerate(C_SHIFTS):
-        opposite = OPPOSITE_PYTHON[direction]
+    for direction, shift in enumerate(
+        C_SHIFTS
+    ):
+        opposite = (
+            OPPOSITE_PYTHON[direction]
+        )
+
+        # -----------------------------------------------------
+        # Ordinary pull streaming
+        # -----------------------------------------------------
 
         pulled = pull_shift_no_wrap(
             post_collision[direction],
@@ -477,44 +560,76 @@ def pull_stream_and_bounce(
             fill_value=0.0,
         )
 
-        halfway_bounce = post_collision[opposite]
+        # -----------------------------------------------------
+        # Bounce-back quantities
+        # -----------------------------------------------------
+
+        halfway_bounce = (
+            post_collision[opposite]
+        )
+
         q = wall_fraction[direction]
 
-        # The second fluid node is one lattice step away from the wall in the
-        # direction opposite the solid source: x + c_i.
-        away_shift = tuple(-component for component in shift)
-
-        opposite_at_second_fluid = pull_shift_no_wrap(
-            post_collision[opposite],
-            away_shift,
-            fill_value=0.0,
+        # For the q < 0.5 BFL branch we need the population
+        # one additional fluid lattice node away from the wall.
+        away_shift = tuple(
+            -component
+            for component in shift
         )
 
-        second_node_is_fluid = pull_shift_no_wrap(
-            ~solid,
-            away_shift,
-            fill_value=False,
-        )
-
-        second_node_is_valid = valid_source_mask(
-            solid.shape,
-            away_shift,
+        opposite_at_second_fluid = (
+            pull_shift_no_wrap(
+                post_collision[opposite],
+                away_shift,
+                fill_value=0.0,
+            )
         )
 
         can_use_near_wall_branch = (
-            second_node_is_fluid
-            & second_node_is_valid
+            second_fluid_available[
+                direction
+            ]
         )
 
-        # Bouzidi-Firdaouss-Lallemand linear interpolation.
+        # -----------------------------------------------------
+        # BFL interpolation
+        # -----------------------------------------------------
+
+        # q < 0.5:
+        #
+        # use the neighbouring fluid node when available.
         near_wall_bounce = (
-            2.0 * q * halfway_bounce
-            + (1.0 - 2.0 * q) * opposite_at_second_fluid
+            2.0
+            * q
+            * halfway_bounce
+            + (
+                1.0
+                - 2.0 * q
+            )
+            * opposite_at_second_fluid
+        )
+
+        # q >= 0.5:
+        #
+        # interpolation uses populations at the current
+        # fluid node.
+        safe_q = jnp.maximum(
+            q,
+            1.0e-6,
         )
 
         far_wall_bounce = (
-            halfway_bounce / (2.0 * q)
-            + ((2.0 * q - 1.0) / (2.0 * q))
+            halfway_bounce
+            / (2.0 * safe_q)
+            + (
+                (
+                    2.0 * safe_q
+                    - 1.0
+                )
+                / (
+                    2.0 * safe_q
+                )
+            )
             * post_collision[direction]
         )
 
@@ -528,15 +643,25 @@ def pull_stream_and_bounce(
             far_wall_bounce,
         )
 
-        streamed_directions.append(
-            jnp.where(
-                source_solid[direction],
-                interpolated_bounce,
-                pulled,
-            )
+        # -----------------------------------------------------
+        # Use BFL only on actual fluid-to-solid links.
+        # Everywhere else use ordinary streamed population.
+        # -----------------------------------------------------
+
+        streamed_direction = jnp.where(
+            source_solid[direction],
+            interpolated_bounce,
+            pulled,
         )
 
-    streamed = jnp.stack(streamed_directions, axis=0)
+        streamed_directions.append(
+            streamed_direction
+        )
+
+    streamed = jnp.stack(
+        streamed_directions,
+        axis=0,
+    )
 
     return apply_axial_boundaries(
         streamed,
@@ -546,14 +671,15 @@ def pull_stream_and_bounce(
     )
 
 def _lbm_step_zero_force(
-    distributions: Array,
-    solid: Array,
-    source_solid: Array,
-    wall_fraction: Array,
-    omega: Array | float,
-    inlet_velocity: float,
-    inlet_density: float,
-) -> Array:
+    distributions,
+    solid,
+    source_solid,
+    wall_fraction,
+    second_fluid_available,
+    omega,
+    inlet_velocity,
+    inlet_density,
+):
     rho, velocity = macroscopic_fields(
         distributions,
         jnp.zeros(
@@ -581,6 +707,7 @@ def _lbm_step_zero_force(
         post_collision,
         source_solid,
         wall_fraction,
+        second_fluid_available,
         solid,
         inlet_velocity=inlet_velocity,
         inlet_density=inlet_density,
@@ -592,17 +719,18 @@ def lbm_step(
     solid: Array,
     source_solid: Array,
     wall_fraction: Array,
-    force: Array,
+    second_fluid_available: Array,
     omega: Array | float,
     inlet_velocity: float,
     inlet_density: float = 1.0,
 ) -> Array:
+    """Advance one zero-force BFL LBM timestep."""
     return _lbm_step_zero_force(
         distributions,
         solid,
         source_solid,
         wall_fraction,
-        force,
+        second_fluid_available,
         omega,
         inlet_velocity,
         inlet_density,
@@ -615,16 +743,17 @@ def lbm_step(
     donate_argnums=(0,),
 )
 def run_steps(
-    distributions: Array,
-    solid: Array,
-    source_solid: Array,
-    wall_fraction: Array,
-    omega: Array | float,
-    inlet_velocity: float,
-    inlet_density: float = 1.0,
+    distributions,
+    solid,
+    source_solid,
+    wall_fraction,
+    second_fluid_available,
+    omega,
+    inlet_velocity,
+    inlet_density=1.0,
     *,
-    number_of_steps: int,
-) -> Array:
+    number_of_steps,
+):
     def body(
         _,
         current_distributions,
@@ -634,6 +763,7 @@ def run_steps(
             solid,
             source_solid,
             wall_fraction,
+            second_fluid_available,
             omega,
             inlet_velocity,
             inlet_density,
@@ -645,6 +775,10 @@ def run_steps(
         body,
         distributions,
     )
+
+
+
+
 
 def initialize_distributions(
     solid,
@@ -946,3 +1080,246 @@ def apply_axial_boundaries(
 
     return result
 
+
+@partial(
+    jax.jit,
+    static_argnames=("number_of_steps",),
+)
+def run_steps_with_residual(
+    distributions: Array,
+    solid: Array,
+    source_solid: Array,
+    wall_fraction: Array,
+    second_fluid_available: Array,
+    omega: Array | float,
+    inlet_velocity: float,
+    inlet_density: float,
+    interior_mask: Array,
+    *,
+    number_of_steps: int,
+):
+    """
+    Run one block and return:
+
+        final_distributions,
+        relative block-wise residual
+
+    The residual compares the state before and after the whole block.
+    """
+
+    initial_distributions = distributions
+
+    def body(
+        _,
+        current_distributions,
+    ):
+        return _lbm_step_zero_force(
+            current_distributions,
+            solid,
+            source_solid,
+            wall_fraction,
+            second_fluid_available,
+            omega,
+            inlet_velocity,
+            inlet_density,
+        )
+
+    final_distributions = lax.fori_loop(
+        0,
+        number_of_steps,
+        body,
+        distributions,
+    )
+
+    block_difference = (
+        final_distributions
+        - initial_distributions
+    )
+
+    mask = interior_mask[None, ...]
+
+    difference_squared = jnp.sum(
+        jnp.where(
+            mask,
+            block_difference**2,
+            0.0,
+        )
+    )
+
+    initial_squared = jnp.sum(
+        jnp.where(
+            mask,
+            initial_distributions**2,
+            0.0,
+        )
+    )
+
+    block_residual = jnp.sqrt(
+        difference_squared
+        / jnp.maximum(
+            initial_squared,
+            1.0e-12,
+        )
+    )
+
+    return (
+        final_distributions,
+        block_residual,
+    )
+
+
+#experimental implicit states
+
+@jax.jit
+def lbm_fixed_point_residual(
+    distributions: Array,
+    solid: Array,
+    source_solid: Array,
+    wall_fraction: Array,
+    second_fluid_available: Array,
+    omega: Array | float,
+    inlet_velocity: float,
+    inlet_density: float = 1.0,
+) -> Array:
+    """
+    One-step steady-state residual on physical fluid nodes.
+
+    At a steady LBM solution,
+
+        f = G(f)
+
+    on fluid nodes.
+    """
+
+    next_distributions = _lbm_step_zero_force(
+        distributions,
+        solid,
+        source_solid,
+        wall_fraction,
+        second_fluid_available,
+        omega,
+        inlet_velocity,
+        inlet_density,
+    )
+
+    residual = (
+        distributions
+        - next_distributions
+    )
+
+    return jnp.where(
+        (~solid)[None, ...],
+        residual,
+        0.0,
+    )
+
+@jax.jit
+def lbm_fixed_point_loss(
+    distributions: Array,
+    solid: Array,
+    source_solid: Array,
+    wall_fraction: Array,
+    second_fluid_available: Array,
+    omega: Array | float,
+    inlet_velocity: float,
+    inlet_density: float = 1.0,
+) -> Array:
+    """
+    Relative squared fixed-point residual on fluid nodes only.
+    """
+
+    residual = lbm_fixed_point_residual(
+        distributions,
+        solid,
+        source_solid,
+        wall_fraction,
+        second_fluid_available,
+        omega,
+        inlet_velocity,
+        inlet_density,
+    )
+
+    fluid_mask = (
+        (~solid)[None, ...]
+    )
+
+    residual_squared = jnp.sum(
+        jnp.where(
+            fluid_mask,
+            residual**2,
+            0.0,
+        )
+    )
+
+    state_squared = jnp.sum(
+        jnp.where(
+            fluid_mask,
+            distributions**2,
+            0.0,
+        )
+    )
+
+    return (
+        residual_squared
+        / jnp.maximum(
+            state_squared,
+            1.0e-12,
+        )
+    )
+
+
+def lbm_residual_from_params(
+    distributions,
+    params,
+    *,
+    shape,
+    length_x,
+    length_y,
+    length_z,
+    period,
+    cylinder_radius,
+    level,
+    inlet_buffer_cells,
+    outlet_buffer_cells,
+    omega,
+    inlet_velocity,
+    inlet_density=1.0,
+    solid_side="positive",
+):
+    solid, boundary_field = build_filled_gyroid_geometry(
+        params,
+        shape=shape,
+        length_x=length_x,
+        length_y=length_y,
+        length_z=length_z,
+        period=period,
+        cylinder_radius=cylinder_radius,
+        level=level,
+        solid_side=solid_side,
+        dtype=distributions.dtype,
+    )
+
+    # Clear TPMS from inlet/outlet buffers here
+    # exactly as you currently do in init_geometry().
+    #
+    # Then:
+
+    solid, source_solid, wall_fraction = prepare_geometry(
+        solid,
+        boundary_field,
+    )
+
+    second_fluid_available = precompute_bfl_auxiliary(
+        solid
+    )
+
+    return lbm_fixed_point_residual(
+        distributions,
+        solid,
+        source_solid,
+        wall_fraction,
+        second_fluid_available,
+        omega,
+        inlet_velocity,
+        inlet_density,
+    )

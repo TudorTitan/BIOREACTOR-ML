@@ -4,6 +4,7 @@ os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
 import matplotlib.pyplot as plt
 import numpy as np
+import json
 
 import jax
 import jax.numpy as jnp
@@ -18,7 +19,11 @@ from src.fluid import (
     omega_from_viscosity,
     prepare_geometry,
     run_steps,
+    run_steps_with_residual,
+    precompute_bfl_auxiliary,
     viscosity_from_omega,
+    lbm_fixed_point_loss,
+    lbm_fixed_point_residual
 )
 from src.geometry import Grid
 
@@ -160,70 +165,44 @@ def heuristic_velocity_initialisation(
     return velocity
 
 
-# ---------------------------------------------------------------------------
-# Output folders
-# ---------------------------------------------------------------------------
-
-os.makedirs(
-    "plots",
-    exist_ok=True,
-)
-
 
 # ---------------------------------------------------------------------------
 # Grid
 # ---------------------------------------------------------------------------
 
-RESOLUTION = 1.5
 
-nx = int(200 * RESOLUTION)
-ny = int(64 * RESOLUTION)
-nz = int(64 * RESOLUTION)
+with open("CONFIG.json", 'rb') as f:
+    CONFIG = json.load(f)
 
-
-length_x=(nx/ny)*1.0
-length_y=1.0
-length_z=1.0
 
 grid = Grid(
-    nx=nx,
-    ny=ny,
-    nz=nz,
-    length_x=length_x,
-    length_y=length_y,
-    length_z=length_z,
+    nx=int(CONFIG['length'] * CONFIG['resolution']),
+    ny=int(CONFIG['diameter'] * CONFIG['resolution']),
+    nz=int(CONFIG['diameter'] * CONFIG['resolution']),
+    length_x=(int(CONFIG['length'] * CONFIG['resolution'])/int(CONFIG['diameter'] * CONFIG['resolution']))*1.0,
+    length_y=1.0,
+    length_z=1.0,
 )
+
 
 x, y, z = grid.coordinates()
 
 
-# ---------------------------------------------------------------------------
-# Cylindrical tube
-# ---------------------------------------------------------------------------
-
-radius = 0.45
 
 
-gyroid_period = 0.25 #0.5
-gyroid_level = 0.0
-
-gyroid_solid_side = "positive"
-
-inlet_buffer_cells = 12
-outlet_buffer_cells = 16
 
 # ---------------------------------------------------------------------------
 # Filled gyroid geometry
 # ---------------------------------------------------------------------------
 
 #gyroin, schwarz_p, schwarz_d
-params = {"A": 0.0, "B" : 0.0, "C": 1.0}
+params = {"A": 0.0, "B" : 1.0, "C": 0.0}
 
-def init_geometry(params,grid,nx,ny,nz, gyroid_period, gyroid_level, radius, gyroid_solid_side, inlet_buffer_cells, outlet_buffer_cells):
+def init_geometry(params,grid, gyroid_period, gyroid_level, radius, gyroid_solid_side, inlet_buffer_cells, outlet_buffer_cells):
 
     solid, boundary_field = build_filled_gyroid_geometry(
         params,
-        shape=(nx, ny, nz),
+        shape=(grid.nx, grid.ny, grid.nz),
         length_x=grid.length_x,
         length_y=grid.length_y,
         length_z=grid.length_z,
@@ -304,19 +283,34 @@ def init_geometry(params,grid,nx,ny,nz, gyroid_period, gyroid_level, radius, gyr
     )
 
 
-    solid, source_solid, wall_fraction = prepare_geometry(
-        solid,
-        boundary_field,
+    solid, source_solid, wall_fraction = (
+        prepare_geometry(
+            solid,
+            boundary_field,
+        )
     )
 
-    return solid, source_solid, wall_fraction, boundary_field
+    second_fluid_available = (
+        precompute_bfl_auxiliary(
+            solid
+        )
+    )
+
+    return solid, source_solid, wall_fraction, boundary_field, second_fluid_available
 
 # ---------------------------------------------------------------------------
 # Geometry diagnostics
 # ---------------------------------------------------------------------------
 
 
-solid, source_solid, wall_fraction, boundary_field = init_geometry(params, grid,nx,ny,nz,gyroid_period, gyroid_level, radius, gyroid_solid_side, inlet_buffer_cells, outlet_buffer_cells)
+solid, source_solid, wall_fraction, boundary_field, second_fluid_available = init_geometry(params, 
+                                                                   grid,
+                                                                   CONFIG['gyroid_period'],
+                                                                   CONFIG['gyroid_level'], 
+                                                                   CONFIG['radius'], 
+                                                                   CONFIG['gyroid_solid_side'], 
+                                                                   CONFIG['inlet_buffer_cells'], 
+                                                                   CONFIG['outlet_buffer_cells'])
 
 
 
@@ -354,7 +348,6 @@ def lattice_viscosity_from_flow_rate(
 
 
 
-
 def init_fluid(solid,inlet_density, inlet_velocity, boundary_field, flow_rate = 500, warm_up = False):
     fluid = ~solid
 
@@ -388,7 +381,7 @@ def init_fluid(solid,inlet_density, inlet_velocity, boundary_field, flow_rate = 
         flow_rate_ul_per_min=flow_rate,
         tube_length_mm=10,
         tube_diameter_mm=2.9,
-        lattice_diameter=2 * radius * ny,
+        lattice_diameter=2 * CONFIG['radius'] * grid.ny,
         lattice_inlet_velocity=inlet_velocity,
     )
 
@@ -407,165 +400,545 @@ fluid, distributions, omega, force = init_fluid(solid, inlet_density, inlet_velo
 
 
 
-print(
-    "grid shape:",
-    solid.shape,
+# prepare distribution when making a small change to geometry
+
+def warm_start_new_geometry(
+    old_distributions,
+    old_solid,
+    new_solid,
+    *,
+    force,
+    inlet_density: float = 1.0,
+    inlet_velocity: float = 0.003,
+    new_boundary_field=None,
+    use_heuristic_for_new_fluid: bool = True,
+):
+    """
+    Transfer a converged LBM solution from one geometry to a nearby geometry.
+
+    Parameters
+    ----------
+    old_distributions:
+        Converged distributions for the old geometry, with shape
+        (19, nx, ny, nz).
+
+    old_solid:
+        Boolean mask for the old geometry.
+
+    new_solid:
+        Boolean mask for the new geometry.
+
+    force:
+        Force vector used by macroscopic_fields.
+
+    inlet_density:
+        Reference density.
+
+    inlet_velocity:
+        Target inlet velocity.
+
+    new_boundary_field:
+        Continuous boundary field for the new geometry. Used by the
+        heuristic when initialising newly opened fluid nodes.
+
+    use_heuristic_for_new_fluid:
+        If True, use the geometry heuristic for nodes that have become fluid.
+        Otherwise, use the nearest old-fluid velocity.
+
+    Returns
+    -------
+    jax.Array
+        Warm-started distributions for the new geometry.
+    """
+    old_distributions = jnp.asarray(
+        old_distributions,
+        dtype=jnp.float32,
+    )
+
+    old_solid = jnp.asarray(
+        old_solid,
+        dtype=jnp.bool_,
+    )
+
+    new_solid = jnp.asarray(
+        new_solid,
+        dtype=jnp.bool_,
+    )
+
+    if old_solid.shape != new_solid.shape:
+        raise ValueError(
+            "Warm starting requires the old and new geometries "
+            "to use the same grid shape."
+        )
+
+    if old_distributions.shape[1:] != old_solid.shape:
+        raise ValueError(
+            "old_distributions must have shape "
+            "(19,) + old_solid.shape."
+        )
+
+    old_fluid = ~old_solid
+    new_fluid = ~new_solid
+
+    common_fluid = (
+        old_fluid
+        & new_fluid
+    )
+
+    newly_opened = (
+        old_solid
+        & new_fluid
+    )
+
+    newly_closed = (
+        old_fluid
+        & new_solid
+    )
+
+    # Recover the converged old macroscopic fields.
+    old_rho, old_velocity = macroscopic_fields(
+        old_distributions,
+        force,
+        old_solid,
+    )
+
+    # ---------------------------------------------------------
+    # Construct a guess for the new geometry
+    # ---------------------------------------------------------
+
+    rho_guess = jnp.where(
+        common_fluid,
+        old_rho,
+        inlet_density,
+    )
+
+    velocity_guess = jnp.where(
+        common_fluid[None, ...],
+        old_velocity,
+        0.0,
+    )
+
+    if bool(jnp.any(newly_opened)):
+        if (
+            use_heuristic_for_new_fluid
+            and new_boundary_field is not None
+        ):
+            heuristic_velocity = (
+                heuristic_velocity_initialisation(
+                    solid=new_solid,
+                    geometry_field=new_boundary_field,
+                    inlet_velocity=inlet_velocity,
+                )
+            )
+
+            velocity_guess = jnp.where(
+                newly_opened[None, ...],
+                heuristic_velocity,
+                velocity_guess,
+            )
+
+        else:
+            # Fill newly opened nodes from the nearest node that was fluid
+            # in the old geometry.
+            old_fluid_np = np.asarray(
+                old_fluid,
+                dtype=bool,
+            )
+
+            _, nearest_indices = distance_transform_edt(
+                ~old_fluid_np,
+                return_indices=True,
+            )
+
+            old_rho_np = np.asarray(
+                old_rho
+            )
+
+            old_velocity_np = np.asarray(
+                old_velocity
+            )
+
+            nearest_rho = old_rho_np[
+                nearest_indices[0],
+                nearest_indices[1],
+                nearest_indices[2],
+            ]
+
+            nearest_velocity = old_velocity_np[
+                :,
+                nearest_indices[0],
+                nearest_indices[1],
+                nearest_indices[2],
+            ]
+
+            nearest_rho = jnp.asarray(
+                nearest_rho,
+                dtype=jnp.float32,
+            )
+
+            nearest_velocity = jnp.asarray(
+                nearest_velocity,
+                dtype=jnp.float32,
+            )
+
+            rho_guess = jnp.where(
+                newly_opened,
+                nearest_rho,
+                rho_guess,
+            )
+
+            velocity_guess = jnp.where(
+                newly_opened[None, ...],
+                nearest_velocity,
+                velocity_guess,
+            )
+
+    # Solids must have zero velocity.
+    velocity_guess = jnp.where(
+        new_solid[None, ...],
+        0.0,
+        velocity_guess,
+    )
+
+    rho_guess = jnp.where(
+        new_solid,
+        inlet_density,
+        rho_guess,
+    )
+
+    guessed_equilibrium = equilibrium(
+        rho_guess,
+        velocity_guess,
+    )
+
+    # ---------------------------------------------------------
+    # Preserve the converged non-equilibrium state wherever the
+    # geometry remains fluid
+    # ---------------------------------------------------------
+
+    warm_distributions = jnp.where(
+        common_fluid[None, ...],
+        old_distributions,
+        guessed_equilibrium,
+    )
+
+    # A benign state for nodes that have become solid.
+    rest_velocity = jnp.zeros_like(
+        velocity_guess
+    )
+
+    rest_equilibrium = equilibrium(
+        jnp.full_like(
+            rho_guess,
+            inlet_density,
+        ),
+        rest_velocity,
+    )
+
+    warm_distributions = jnp.where(
+        new_solid[None, ...],
+        rest_equilibrium,
+        warm_distributions,
+    )
+
+    print(
+        "Warm-start transfer:"
+    )
+
+    print(
+        "  common fluid nodes:",
+        int(jnp.sum(common_fluid)),
+    )
+
+    print(
+        "  newly opened nodes:",
+        int(jnp.sum(newly_opened)),
+    )
+
+    print(
+        "  newly closed nodes:",
+        int(jnp.sum(newly_closed)),
+    )
+
+    print(
+        "  fraction of new fluid reused:",
+        float(
+            jnp.sum(common_fluid)
+            / jnp.maximum(
+                jnp.sum(new_fluid),
+                1,
+            )
+        ),
+    )
+
+    return warm_distributions
+
+
+old_params = params.copy()
+
+old_solid = solid
+old_boundary_field = boundary_field
+old_distributions = distributions
+old_velocity = velocity
+old_rho = rho
+
+distributions = warm_start_new_geometry(
+    old_distributions,
+    old_solid,
+    solid,
+    force=force,
+    inlet_density=inlet_density,
+    inlet_velocity=inlet_velocity,
+    new_boundary_field=boundary_field,
+    use_heuristic_for_new_fluid=True,
 )
 
-print(
-    "solid fraction:",
-    float(jnp.mean(solid)),
-)
 
-print(
-    "fluid fraction:",
-    float(jnp.mean(fluid)),
-)
-
-print(
-    "fluid nodes at inlet:",
-    int(jnp.sum(fluid[0])),
-)
-
-print(
-    "omega:",
-    omega,
-)
-
-print(
-    "recovered viscosity:",
-    viscosity_from_omega(omega),
-)
 
 
 # ---------------------------------------------------------------------------
 # Simulation
 # ---------------------------------------------------------------------------
 
-number_of_blocks = 60
-steps_per_block = 1000
 
-mean_velocities = []
-outlet_mean_velocities = []
-mass_history = []
+def train_fast(
+    distributions,
+    *,
+    number_of_blocks,
+    steps_per_block,
+    convergence_tolerance=1.1e-4,
+):
+    interior_mask = ~solid
+
+    interior_mask = interior_mask.at[
+        :CONFIG["inlet_buffer_cells"],
+        :,
+        :,
+    ].set(False)
+
+    interior_mask = interior_mask.at[
+        -CONFIG["outlet_buffer_cells"]:,
+        :,
+        :,
+    ].set(False)
+
+    for block in range(number_of_blocks):
+
+        distributions, block_residual = (
+            run_steps_with_residual(
+                distributions,
+                solid,
+                source_solid,
+                wall_fraction,
+                omega,
+                inlet_velocity,
+                inlet_density,
+                interior_mask,
+                number_of_steps=steps_per_block,
+            )
+        )
+
+        # Synchronize only once per block.
+        block_residual = float(
+            block_residual
+        )
+
+        print(
+            f"Block {block + 1:03d}: "
+            f"residual = {block_residual:.6e}"
+        )
+
+        if (
+            block_residual
+            < convergence_tolerance
+        ):
+            print(
+                "Early stopping due to convergence."
+            )
+            break
+
+    return distributions
+
+def train(distributions,number_of_blocks,steps_per_block):
+    mean_velocities = []
+    outlet_mean_velocities = []
+    mass_history = []
 
 
-# Measure slightly upstream from the numerical outlet plane.
-measurement_x = (
-    nx
-    - outlet_buffer_cells
-    - 2
-)
-
-target_inlet_velocity = inlet_velocity
-
-# Number of simulation steps over which to reach the target.
-# With steps_per_block = 500, this is a 20-block ramp.
-velocity_ramp_steps = 1000
-
-for block in range(number_of_blocks):
-    completed_steps = block * steps_per_block
-
-    # Use the velocity corresponding to the end of this block.
-    ramp_fraction = min(
-        (completed_steps + steps_per_block)
-        / velocity_ramp_steps,
-        1.0,
+    measurement_x = (
+        grid.nx
+        - CONFIG['outlet_buffer_cells']
+        - 2
     )
 
-    current_inlet_velocity = (
-        target_inlet_velocity * ramp_fraction
-    )
+    target_inlet_velocity = inlet_velocity
 
-    distributions = run_steps(
-        distributions,
-        solid,
-        source_solid,
-        wall_fraction,
-        omega,
-        current_inlet_velocity,  # changed
-        inlet_density,
-        number_of_steps=steps_per_block,
-    ).block_until_ready()
 
-    rho, velocity = macroscopic_fields(
-        distributions,
-        force,
-        solid,
-    )
+    interior_mask = ~solid
 
-    fluid = ~solid
+    interior_mask = interior_mask.at[
+        :CONFIG['inlet_buffer_cells'],
+        :,
+        :,
+    ].set(False)
 
-    fluid_count = jnp.maximum(
-        jnp.sum(fluid),
-        1,
-    )
+    interior_mask = interior_mask.at[
+        -CONFIG['outlet_buffer_cells']:,
+        :,
+        :,
+    ].set(False)
 
-    mean_velocity_x = (
-        jnp.sum(
+    for block in range(number_of_blocks):
+        previous_distributions = jnp.array(
+            distributions,
+            copy=True,
+        )
+        
+        completed_steps = block * steps_per_block
+
+        # Use the velocity corresponding to the end of this block.
+
+        current_inlet_velocity = (
+            target_inlet_velocity 
+        )
+
+        distributions = run_steps(
+            distributions,
+            solid,
+            source_solid,
+            wall_fraction,
+            omega,
+            current_inlet_velocity,  # changed
+            inlet_density,
+            number_of_steps=steps_per_block,
+        ).block_until_ready()
+
+        rho, velocity = macroscopic_fields(
+            distributions,
+            force,
+            solid,
+        )
+
+        fluid = ~solid
+
+        fluid_count = jnp.maximum(
+            jnp.sum(fluid),
+            1,
+        )
+
+        mean_velocity_x = (
+            jnp.sum(
+                jnp.where(
+                    fluid,
+                    velocity[0],
+                    0.0,
+                )
+            )
+            / fluid_count
+        )
+
+        outlet_fluid = fluid[
+            measurement_x,
+            :,
+            :,
+        ]
+
+        outlet_fluid_count = jnp.maximum(
+            jnp.sum(outlet_fluid),
+            1,
+        )
+
+        outlet_mean_velocity_x = (
+            jnp.sum(
+                jnp.where(
+                    outlet_fluid,
+                    velocity[
+                        0,
+                        measurement_x,
+                        :,
+                        :,
+                    ],
+                    0.0,
+                )
+            )
+            / outlet_fluid_count
+        )
+
+        total_fluid_mass = jnp.sum(
             jnp.where(
                 fluid,
-                velocity[0],
+                rho,
                 0.0,
             )
         )
-        / fluid_count
-    )
 
-    outlet_fluid = fluid[
-        measurement_x,
-        :,
-        :,
-    ]
+        mean_velocities.append(
+            float(mean_velocity_x)
+        )
 
-    outlet_fluid_count = jnp.maximum(
-        jnp.sum(outlet_fluid),
-        1,
-    )
+        outlet_mean_velocities.append(
+            float(outlet_mean_velocity_x)
+        )
 
-    outlet_mean_velocity_x = (
-        jnp.sum(
-            jnp.where(
-                outlet_fluid,
-                velocity[
-                    0,
-                    measurement_x,
-                    :,
-                    :,
-                ],
-                0.0,
+        mass_history.append(
+            float(total_fluid_mass)
+        )
+
+        # ------------------------------------------------------------
+        # One-step fixed-point diagnostic
+        # ------------------------------------------------------------
+
+
+        block_difference = (
+            distributions
+            - previous_distributions
+        )
+
+        block_residual = jnp.sqrt(
+            jnp.sum(
+                jnp.where(
+                    interior_mask[None, ...],
+                    block_difference**2,
+                    0.0,
+                )
+            )
+            / jnp.maximum(
+                jnp.sum(
+                    jnp.where(
+                        interior_mask[None, ...],
+                        previous_distributions**2,
+                        0.0,
+                    )
+                ),
+                1.0e-12,
             )
         )
-        / outlet_fluid_count
-    )
 
-    total_fluid_mass = jnp.sum(
-        jnp.where(
-            fluid,
-            rho,
-            0.0,
+        block_residual = float(
+            block_residual
         )
-    )
 
-    mean_velocities.append(
-        float(mean_velocity_x)
-    )
 
-    outlet_mean_velocities.append(
-        float(outlet_mean_velocity_x)
-    )
 
-    mass_history.append(
-        float(total_fluid_mass)
-    )
+        print(
+            f"Block {block + 1:03d}: "
+            f"inlet ux = {current_inlet_velocity:.6e}, "
+            f"mean ux = {mean_velocities[-1]:.6e}, "
+            f"outlet ux = {outlet_mean_velocities[-1]:.6e}, "
+            f"mass = {mass_history[-1]:.6e}, "
+            f"delta_loss = {block_residual:.6e}"
+        )
 
-    print(
-        f"Block {block + 1:03d}: "
-        f"inlet ux = {current_inlet_velocity:.6e}, "
-        f"mean ux = {mean_velocities[-1]:.6e}, "
-        f"outlet ux = {outlet_mean_velocities[-1]:.6e}, "
-        f"mass = {mass_history[-1]:.6e}"
-    )
+        #if low loss and it increases then converged
+        if block_residual < 0.00011:
+            print("Early stopping due to convergence")
+            break
+
+    return distributions,     mean_velocities, outlet_mean_velocities, mass_history
+
+
+distributions = train(distributions, number_of_blocks=100, steps_per_block=1000)
+
 
 
 #mean ux = 5.404868e-03, outlet ux = 7.135368e-03, mass = 2.925739e+05
@@ -1274,9 +1647,9 @@ rho, velocity = macroscopic_fields(
 figure = plot_tpms_velocity(
     velocity,
     solid,
-    period=gyroid_period,
-    cylinder_radius=radius,
-    level=gyroid_level,
+    period=CONFIG['gyroid_period'],
+    cylinder_radius=CONFIG['radius'],
+    level=CONFIG['gyroid_level'],
     cone_spacing=5,
     surface_opacity=1.0,
 )
@@ -1334,604 +1707,3 @@ print(
 )
 
 
-
-
-
-#-------------------- Cell convergence
-
-
-
-
-
-
-class RepeatingCellComparison(NamedTuple):
-    cell_index: np.ndarray
-
-    inlet_x: np.ndarray
-    outlet_x: np.ndarray
-
-    absolute_l2_difference: np.ndarray
-    relative_l2_difference: np.ndarray
-
-    axial_l2_difference: np.ndarray
-    transverse_l2_difference: np.ndarray
-
-    inlet_mean_speed: np.ndarray
-    outlet_mean_speed: np.ndarray
-
-    inlet_flow_rate: np.ndarray
-    outlet_flow_rate: np.ndarray
-
-    common_fluid_fraction: np.ndarray
-
-
-def _interpolate_x_plane(
-    field: np.ndarray,
-    *,
-    x_position: float,
-    length_x: float,
-) -> np.ndarray:
-    """
-    Linearly interpolate an array at an exact axial position.
-
-    Parameters
-    ----------
-    field:
-        Array whose first spatial axis is x.
-
-        Supported shapes:
-            (nx, ny, nz)
-            (components, nx, ny, nz)
-
-    x_position:
-        Position at which to evaluate the field.
-
-    length_x:
-        Physical/dimensionless axial length of the grid.
-    """
-    if field.ndim not in (3, 4):
-        raise ValueError(
-            "field must have shape (nx, ny, nz) or "
-            "(components, nx, ny, nz)"
-        )
-
-    nx = field.shape[-3]
-
-    if not 0.0 <= x_position <= length_x:
-        raise ValueError(
-            f"x_position={x_position} lies outside "
-            f"[0, {length_x}]"
-        )
-
-    # This matches np.linspace(0, length_x, nx).
-    continuous_index = (
-        x_position
-        * (nx - 1)
-        / length_x
-    )
-
-    lower_index = int(
-        np.floor(continuous_index)
-    )
-
-    upper_index = min(
-        lower_index + 1,
-        nx - 1,
-    )
-
-    interpolation_weight = (
-        continuous_index - lower_index
-    )
-
-    if field.ndim == 4:
-        lower_plane = field[
-            :,
-            lower_index,
-            :,
-            :,
-        ]
-
-        upper_plane = field[
-            :,
-            upper_index,
-            :,
-            :,
-        ]
-    else:
-        lower_plane = field[
-            lower_index,
-            :,
-            :,
-        ]
-
-        upper_plane = field[
-            upper_index,
-            :,
-            :,
-        ]
-
-    return (
-        (1.0 - interpolation_weight)
-        * lower_plane
-        + interpolation_weight
-        * upper_plane
-    )
-
-
-def compare_repeating_cell_vector_fields(
-    velocity,
-    solid,
-    *,
-    length_x: float,
-    cell_length: float,
-    start_x: float,
-    end_x: float | None = None,
-    minimum_fluid_weight: float = 0.5,
-    epsilon: float = 1.0e-12,
-) -> RepeatingCellComparison:
-    """
-    Compare inlet and outlet velocity fields for every repeated cell.
-
-    For cell k, compare
-
-        velocity(start_x + k * cell_length, y, z)
-
-    with
-
-        velocity(start_x + (k + 1) * cell_length, y, z).
-
-    Exact cell boundaries are evaluated by linear interpolation in x.
-
-    Only locations fluid at both ends of the cell are included. Because
-    the Boolean fluid mask is interpolated, `minimum_fluid_weight`
-    determines when an interpolated location is considered fluid.
-
-    Parameters
-    ----------
-    velocity:
-        Velocity field with shape (3, nx, ny, nz).
-
-    solid:
-        Boolean mask with shape (nx, ny, nz).
-
-    length_x:
-        Total dimensionless domain length.
-
-    cell_length:
-        Repeating-cell length. For your TPMS this will normally equal
-        `gyroid_period`.
-
-    start_x:
-        Beginning of the first complete TPMS cell. This should normally
-        be the end of the inlet buffer, not x = 0.
-
-    end_x:
-        End of the region containing complete repeating cells. This
-        should normally be the beginning of the outlet buffer.
-
-    minimum_fluid_weight:
-        Threshold applied to the interpolated fluid mask.
-
-    Returns
-    -------
-    RepeatingCellComparison
-        One result per complete repeating cell.
-    """
-    velocity_np = np.asarray(
-        velocity,
-        dtype=np.float64,
-    )
-
-    solid_np = np.asarray(
-        solid,
-        dtype=bool,
-    )
-
-    if (
-        velocity_np.ndim != 4
-        or velocity_np.shape[0] != 3
-    ):
-        raise ValueError(
-            "velocity must have shape "
-            "(3, nx, ny, nz)"
-        )
-
-    if solid_np.shape != velocity_np.shape[1:]:
-        raise ValueError(
-            "solid must have shape "
-            "velocity.shape[1:]"
-        )
-
-    if length_x <= 0.0:
-        raise ValueError(
-            "length_x must be positive"
-        )
-
-    if cell_length <= 0.0:
-        raise ValueError(
-            "cell_length must be positive"
-        )
-
-    if end_x is None:
-        end_x = length_x
-
-    if not 0.0 <= start_x < end_x <= length_x:
-        raise ValueError(
-            "Require "
-            "0 <= start_x < end_x <= length_x"
-        )
-
-    available_length = end_x - start_x
-
-    number_of_cells = int(
-        np.floor(
-            available_length / cell_length
-            + 1.0e-10
-        )
-    )
-
-    if number_of_cells < 1:
-        raise ValueError(
-            "The selected region contains no complete cells."
-        )
-
-    fluid_float = (
-        ~solid_np
-    ).astype(np.float64)
-
-    cell_indices = []
-    inlet_positions = []
-    outlet_positions = []
-
-    absolute_differences = []
-    relative_differences = []
-
-    axial_differences = []
-    transverse_differences = []
-
-    inlet_mean_speeds = []
-    outlet_mean_speeds = []
-
-    inlet_flow_rates = []
-    outlet_flow_rates = []
-
-    common_fluid_fractions = []
-
-    for cell_index in range(number_of_cells):
-        inlet_x = (
-            start_x
-            + cell_index * cell_length
-        )
-
-        outlet_x = (
-            inlet_x + cell_length
-        )
-
-        inlet_velocity = _interpolate_x_plane(
-            velocity_np,
-            x_position=inlet_x,
-            length_x=length_x,
-        )
-
-        outlet_velocity = _interpolate_x_plane(
-            velocity_np,
-            x_position=outlet_x,
-            length_x=length_x,
-        )
-
-        inlet_fluid_weight = _interpolate_x_plane(
-            fluid_float,
-            x_position=inlet_x,
-            length_x=length_x,
-        )
-
-        outlet_fluid_weight = _interpolate_x_plane(
-            fluid_float,
-            x_position=outlet_x,
-            length_x=length_x,
-        )
-
-        common_fluid = (
-            (inlet_fluid_weight >= minimum_fluid_weight)
-            & (
-                outlet_fluid_weight
-                >= minimum_fluid_weight
-            )
-        )
-
-        common_count = int(
-            np.sum(common_fluid)
-        )
-
-        if common_count == 0:
-            absolute_difference = np.nan
-            relative_difference = np.nan
-            axial_difference = np.nan
-            transverse_difference = np.nan
-            inlet_mean_speed = np.nan
-            outlet_mean_speed = np.nan
-            inlet_flow_rate = np.nan
-            outlet_flow_rate = np.nan
-        else:
-            inlet_common = inlet_velocity[
-                :,
-                common_fluid,
-            ]
-
-            outlet_common = outlet_velocity[
-                :,
-                common_fluid,
-            ]
-
-            vector_difference = (
-                outlet_common - inlet_common
-            )
-
-            absolute_difference = np.sqrt(
-                np.mean(
-                    np.sum(
-                        vector_difference**2,
-                        axis=0,
-                    )
-                )
-            )
-
-            inlet_field_norm = np.sqrt(
-                np.mean(
-                    np.sum(
-                        inlet_common**2,
-                        axis=0,
-                    )
-                )
-            )
-
-            relative_difference = (
-                absolute_difference
-                / max(
-                    inlet_field_norm,
-                    epsilon,
-                )
-            )
-
-            axial_difference = np.sqrt(
-                np.mean(
-                    (
-                        outlet_common[0]
-                        - inlet_common[0]
-                    ) ** 2
-                )
-            )
-
-            transverse_difference = np.sqrt(
-                np.mean(
-                    (
-                        outlet_common[1]
-                        - inlet_common[1]
-                    ) ** 2
-                    + (
-                        outlet_common[2]
-                        - inlet_common[2]
-                    ) ** 2
-                )
-            )
-
-            inlet_speed = np.sqrt(
-                np.sum(
-                    inlet_common**2,
-                    axis=0,
-                )
-            )
-
-            outlet_speed = np.sqrt(
-                np.sum(
-                    outlet_common**2,
-                    axis=0,
-                )
-            )
-
-            inlet_mean_speed = float(
-                np.mean(inlet_speed)
-            )
-
-            outlet_mean_speed = float(
-                np.mean(outlet_speed)
-            )
-
-            # Lattice flux through the cross-section.
-            # Density is omitted here, so this is volumetric rather
-            # than mass flux.
-            inlet_flow_rate = float(
-                np.sum(
-                    np.where(
-                        inlet_fluid_weight
-                        >= minimum_fluid_weight,
-                        inlet_velocity[0],
-                        0.0,
-                    )
-                )
-            )
-
-            outlet_flow_rate = float(
-                np.sum(
-                    np.where(
-                        outlet_fluid_weight
-                        >= minimum_fluid_weight,
-                        outlet_velocity[0],
-                        0.0,
-                    )
-                )
-            )
-
-        cell_indices.append(cell_index)
-        inlet_positions.append(inlet_x)
-        outlet_positions.append(outlet_x)
-
-        absolute_differences.append(
-            absolute_difference
-        )
-
-        relative_differences.append(
-            relative_difference
-        )
-
-        axial_differences.append(
-            axial_difference
-        )
-
-        transverse_differences.append(
-            transverse_difference
-        )
-
-        inlet_mean_speeds.append(
-            inlet_mean_speed
-        )
-
-        outlet_mean_speeds.append(
-            outlet_mean_speed
-        )
-
-        inlet_flow_rates.append(
-            inlet_flow_rate
-        )
-
-        outlet_flow_rates.append(
-            outlet_flow_rate
-        )
-
-        common_fluid_fractions.append(
-            common_count
-            / common_fluid.size
-        )
-
-    return RepeatingCellComparison(
-        cell_index=np.asarray(
-            cell_indices,
-            dtype=int,
-        ),
-        inlet_x=np.asarray(
-            inlet_positions,
-            dtype=float,
-        ),
-        outlet_x=np.asarray(
-            outlet_positions,
-            dtype=float,
-        ),
-        absolute_l2_difference=np.asarray(
-            absolute_differences,
-            dtype=float,
-        ),
-        relative_l2_difference=np.asarray(
-            relative_differences,
-            dtype=float,
-        ),
-        axial_l2_difference=np.asarray(
-            axial_differences,
-            dtype=float,
-        ),
-        transverse_l2_difference=np.asarray(
-            transverse_differences,
-            dtype=float,
-        ),
-        inlet_mean_speed=np.asarray(
-            inlet_mean_speeds,
-            dtype=float,
-        ),
-        outlet_mean_speed=np.asarray(
-            outlet_mean_speeds,
-            dtype=float,
-        ),
-        inlet_flow_rate=np.asarray(
-            inlet_flow_rates,
-            dtype=float,
-        ),
-        outlet_flow_rate=np.asarray(
-            outlet_flow_rates,
-            dtype=float,
-        ),
-        common_fluid_fraction=np.asarray(
-            common_fluid_fractions,
-            dtype=float,
-        ),
-    )
-
-
-dx = (
-    grid.length_x
-    / (grid.nx - 1)
-)
-
-cell_start_x = (
-    inlet_buffer_cells * dx
-)
-
-cell_end_x = (
-    grid.length_x
-    - outlet_buffer_cells * dx
-)
-
-cell_comparison = (
-    compare_repeating_cell_vector_fields(
-        velocity,
-        solid,
-        length_x=grid.length_x,
-        cell_length=gyroid_period,
-        start_x=cell_start_x,
-        end_x=cell_end_x,
-    )
-)
-
-for index in range(
-    cell_comparison.cell_index.size
-):
-    print(
-        f"Cell {cell_comparison.cell_index[index]:02d}: "
-        f"x = "
-        f"{cell_comparison.inlet_x[index]:.4f}"
-        f" -> "
-        f"{cell_comparison.outlet_x[index]:.4f}, "
-        f"relative field difference = "
-        f"{cell_comparison.relative_l2_difference[index]:.6e}, "
-        f"axial difference = "
-        f"{cell_comparison.axial_l2_difference[index]:.6e}, "
-        f"transverse difference = "
-        f"{cell_comparison.transverse_l2_difference[index]:.6e}, "
-        f"Qin = "
-        f"{cell_comparison.inlet_flow_rate[index]:.6e}, "
-        f"Qout = "
-        f"{cell_comparison.outlet_flow_rate[index]:.6e}"
-    )
-
-plt.figure(
-    figsize=(8, 5)
-)
-
-plt.semilogy(
-    cell_comparison.cell_index,
-    cell_comparison.relative_l2_difference,
-    marker="o",
-)
-
-plt.xlabel(
-    "Repeating-cell index"
-)
-
-plt.ylabel(
-    "Relative inlet/outlet velocity-field difference"
-)
-
-plt.title(
-    "Development towards a cell-periodic velocity field"
-)
-
-plt.grid(
-    alpha=0.3,
-)
-
-plt.tight_layout()
-
-plt.savefig(
-    "plots/cell_periodicity.png",
-    dpi=200,
-)
-
-plt.show()
