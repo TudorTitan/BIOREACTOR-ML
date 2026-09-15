@@ -1168,7 +1168,6 @@ def run_steps_with_residual(
     )
 
 
-#experimental implicit states
 
 @jax.jit
 def lbm_fixed_point_residual(
@@ -1323,3 +1322,62 @@ def lbm_residual_from_params(
         inlet_velocity,
         inlet_density,
     )
+
+@jax.jit
+def lbm_raw_residual_loss(
+    distributions: Array,
+    solid: Array,
+    source_solid: Array,
+    wall_fraction: Array,
+    second_fluid_available: Array,
+    omega: Array | float,
+    inlet_velocity: float,
+    inlet_density: float = 1.0,
+) -> Array:
+    """
+    Raw RMS residual of the steady LBM fixed-point equation
+
+        f - G(f) = 0.
+
+    Returns one scalar. Zero means the current distribution field
+    is an exact steady solution of the discrete LBM equations.
+    """
+
+    next_distributions = _lbm_step_zero_force(
+        distributions,
+        solid,
+        source_solid,
+        wall_fraction,
+        second_fluid_available,
+        omega,
+        inlet_velocity,
+        inlet_density,
+    )
+
+    residual = (
+        next_distributions
+        - distributions
+    )
+
+    fluid = ~solid
+
+    residual_squared = jnp.where(
+        fluid[None, ...],
+        residual**2,
+        0.0,
+    )
+
+    number_of_fluid_values = (
+        jnp.sum(fluid)
+        * distributions.shape[0]
+    )
+
+    return jnp.sqrt(
+        jnp.sum(residual_squared)
+        / jnp.maximum(
+            number_of_fluid_values,
+            1,
+        )
+    )
+
+
