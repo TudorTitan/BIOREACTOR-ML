@@ -136,9 +136,8 @@ def grid_search(start_params, n_steps=10, grid=DEFAULT_GRID, step_size=0.1, batc
                 tracer_batch_size=8, show_progress=True, **kwargs):
     """Greedy cached 8-neighbour search on the non-negative A+B+C=1 simplex.
 
-    Unseen neighbours are evaluated in CFD chunks of at most batch_size
-    geometries, then tracer experiments are evaluated in chunks of at most
-    tracer_batch_size geometries.
+    The persistent cache stores scores only. Full CFD/tracer arrays are kept
+    only for the current winner and candidates in the current search step.
     """
     if batch_size < 1:
         raise ValueError('batch_size must be at least 1')
@@ -151,64 +150,80 @@ def grid_search(start_params, n_steps=10, grid=DEFAULT_GRID, step_size=0.1, batc
     start = {k: float(start_params[k])/total for k in ('A','B','C')}
     origin_a, origin_b = start['A'], start['B']
     key = (0,0)
+
     if show_progress:
         print("\n=== Grid search: starting geometry ===", flush=True)
     current = run_experiment(start, grid=grid, show_progress=show_progress, **kwargs)
-    cache = {key: current}
+
+    # Persistent state is deliberately lightweight: old candidates keep only
+    # their scalar score and parameters, never their device arrays.
+    score_cache = {key: current.score}
     params_cache = {key: start}
     history = [(start, current.score)]
     cfd_keys = {'number_of_blocks','steps_per_block','residual_tolerance','require_residual_increase'}
+
     for search_step in range(n_steps):
         if show_progress:
             print(f"\n=== Grid-search step {search_step+1}/{n_steps} | current score={current.score:.6f} ===", flush=True)
+
         neighbours = [(key[0]+di, key[1]+dj) for di,dj in DIRECTIONS_8]
         valid = []
         for candidate in neighbours:
             a = origin_a + candidate[0]*step_size
             b = origin_b + candidate[1]*step_size
-            c = 1.0-a-b
-            if min(a,b,c) >= -1e-12:
+            cc = 1.0-a-b
+            if min(a,b,cc) >= -1e-12:
                 valid.append(candidate)
                 params_cache.setdefault(candidate, _simplex_params(max(a,0.0), max(b,0.0)))
-        unseen = [candidate for candidate in valid if candidate not in cache]
+
+        unseen = [candidate for candidate in valid if candidate not in score_cache]
         if show_progress:
             print(f"Valid neighbours: {len(valid)} | unseen: {len(unseen)} | cached: {len(valid)-len(unseen)}", flush=True)
             for candidate in unseen:
                 p = params_cache[candidate]
                 print(f"  -> A={p['A']:.4f}, B={p['B']:.4f}, C={p['C']:.4f}", flush=True)
+
+        # Full results exist only for newly evaluated candidates in this step.
+        step_results = {}
+
         if unseen:
             warm = {'distributions': current.cfd.distributions, 'solid': current.cfd.solid}
             measurement_x = grid.nx - CONFIG['outlet_buffer_cells'] - 2
-            pending_cfd = {}
 
-            # CFD is chunked independently because it is the VRAM-heavy stage.
-            for batch_start in range(0, len(unseen), batch_size):
-                batch_candidates = unseen[batch_start:batch_start + batch_size]
-                if show_progress:
-                    batch_number = batch_start // batch_size + 1
-                    number_of_batches = (len(unseen) + batch_size - 1) // batch_size
-                    print(f"\nCFD neighbour batch {batch_number}/{number_of_batches} "
-                          f"({len(batch_candidates)} geometries)", flush=True)
+            # Process enough CFD chunks to fill one tracer chunk. Crucially,
+            # distributions from completed tracer chunks are then released
+            # rather than accumulated for the entire search.
+            for tracer_group_start in range(0, len(unseen), tracer_batch_size):
+                tracer_candidates = unseen[
+                    tracer_group_start:tracer_group_start + tracer_batch_size
+                ]
+                pending_cfd = {}
 
-                batch = run_cfd_batch(
-                    [params_cache[c] for c in batch_candidates],
-                    warm_start=warm,
-                    grid=grid,
-                    show_progress=show_progress,
-                    **{k:v for k,v in kwargs.items() if k in cfd_keys}
-                )
-                for i, candidate in enumerate(batch_candidates):
-                    pending_cfd[candidate] = CFDResult(
-                        batch.distributions[i], batch.solid[i], batch.velocity[i],
-                        batch.block_residuals[:,i], batch.converged[i]
+                for cfd_start in range(0, len(tracer_candidates), batch_size):
+                    batch_candidates = tracer_candidates[cfd_start:cfd_start + batch_size]
+                    global_start = tracer_group_start + cfd_start
+                    if show_progress:
+                        batch_number = global_start // batch_size + 1
+                        number_of_batches = (len(unseen) + batch_size - 1) // batch_size
+                        print(f"\nCFD neighbour batch {batch_number}/{number_of_batches} "
+                              f"({len(batch_candidates)} geometries)", flush=True)
+
+                    batch = run_cfd_batch(
+                        [params_cache[candidate] for candidate in batch_candidates],
+                        warm_start=warm,
+                        grid=grid,
+                        show_progress=show_progress,
+                        **{k:v for k,v in kwargs.items() if k in cfd_keys}
                     )
+                    for i, candidate in enumerate(batch_candidates):
+                        pending_cfd[candidate] = CFDResult(
+                            batch.distributions[i], batch.solid[i], batch.velocity[i],
+                            batch.block_residuals[:,i], batch.converged[i]
+                        )
+                    del batch
 
-            # Tracer has its own configurable batch size. The SciPy contact-mask
-            # preparation and final metric calculation stay outside vmap.
-            for tracer_start in range(0, len(unseen), tracer_batch_size):
-                tracer_candidates = unseen[tracer_start:tracer_start + tracer_batch_size]
                 if show_progress:
-                    tracer_batch_number = tracer_start // tracer_batch_size + 1
+                    tracer_batch_number = tracer_group_start // tracer_batch_size + 1
                     number_of_tracer_batches = (
                         len(unseen) + tracer_batch_size - 1
                     ) // tracer_batch_size
@@ -233,31 +248,64 @@ def grid_search(start_params, n_steps=10, grid=DEFAULT_GRID, step_size=0.1, batc
                     contact_distance_cells=kwargs.get('contact_distance_cells',2.0),
                     score_penalty_weight=kwargs.get('score_penalty_weight',0.5),
                 )
+                del velocities, solids
 
                 for candidate, tracer in zip(tracer_candidates, tracers):
-                    cache[candidate] = ExperimentResult(
-                        pending_cfd[candidate], tracer
-                    )
+                    result = ExperimentResult(pending_cfd[candidate], tracer)
+                    step_results[candidate] = result
+                    score_cache[candidate] = result.score
                     if show_progress:
                         p = params_cache[candidate]
                         print(f"  A={p['A']:.4f}, B={p['B']:.4f}, C={p['C']:.4f} "
-                              f"| score={tracer.score:.6f}", flush=True)
+                              f"| score={result.score:.6f}", flush=True)
+
+                del pending_cfd, tracers
+
         if not valid:
             if show_progress:
                 print("No valid neighbours; stopping.", flush=True)
             break
-        best = max(valid, key=lambda candidate: cache[candidate].score)
-        best_score = cache[best].score
+
+        best = max(valid, key=lambda candidate: score_cache[candidate])
+        best_score = score_cache[best]
         if show_progress:
             p = params_cache[best]
             print(f"Best neighbour: A={p['A']:.4f}, B={p['B']:.4f}, C={p['C']:.4f} | score={best_score:.6f}", flush=True)
+
         if best_score <= current.score:
             if show_progress:
                 print("No improving neighbour; grid search converged.", flush=True)
             break
-        key, current = best, cache[best]
+
+        # An improving neighbour cannot be an old cached point: if it were,
+        # it would already have beaten the current point when first compared.
+        # Therefore its full state is available in this step for warm-starting.
+        if best not in step_results:
+            raise RuntimeError(
+                "Best improving candidate has no live CFD state. "
+                "This indicates an inconsistent grid-search cache."
+            )
+
+        new_current = step_results[best]
+        key = best
+        current = new_current
         history.append((params_cache[key], current.score))
+
+        # Dropping step_results releases all losing CFD/tracer device arrays.
+        del step_results
+
     if show_progress:
         p = params_cache[key]
         print(f"\n=== Grid search complete ===\nBest: A={p['A']:.4f}, B={p['B']:.4f}, C={p['C']:.4f} | score={current.score:.6f}", flush=True)
-    return {'params': params_cache[key], 'score': current.score, 'result': current, 'history': history, 'cache': cache}
+
+    cache = {
+        candidate: {'params': params_cache[candidate], 'score': score}
+        for candidate, score in score_cache.items()
+    }
+    return {
+        'params': params_cache[key],
+        'score': current.score,
+        'result': current,
+        'history': history,
+        'cache': cache,
+    }
