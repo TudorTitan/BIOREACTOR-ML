@@ -974,6 +974,210 @@ def run_tracer_experiment(
     return result
 
 
+def run_tracer_experiments_batch(
+    velocities: jax.Array,
+    solids: jax.Array,
+    *,
+    number_of_steps: int,
+    pulse_duration: int,
+    inlet_concentration: float = 1.0,
+    diffusivity: float = 0.01,
+    dt: float = 1.0,
+    measurement_x: int | None = None,
+    sample_every: int = 1,
+    contact_distance_cells: float = 2.0,
+    score_penalty_weight: float = 0.5,
+) -> list[TracerResult]:
+    """Run the expensive tracer scans for several geometries with vmap.
+
+    Contact masks are prepared on the CPU (SciPy EDT), the JAX tracer scan is
+    vmapped over geometries, and scalar/statistical post-processing is then
+    performed per geometry.
+    """
+    velocities = jnp.asarray(velocities, dtype=jnp.float32)
+    solids = jnp.asarray(solids, dtype=jnp.bool_)
+
+    if velocities.ndim != 5 or velocities.shape[1] != 3:
+        raise ValueError("velocities must have shape (batch, 3, nx, ny, nz).")
+    if solids.ndim != 4 or solids.shape != (velocities.shape[0],) + velocities.shape[2:]:
+        raise ValueError("solids must have shape (batch, nx, ny, nz).")
+    if number_of_steps <= 0:
+        raise ValueError("number_of_steps must be positive.")
+    if pulse_duration < 0:
+        raise ValueError("pulse_duration cannot be negative.")
+    if sample_every <= 0:
+        raise ValueError("sample_every must be positive.")
+    if score_penalty_weight < 0.0:
+        raise ValueError("score_penalty_weight cannot be negative.")
+
+    nx = solids.shape[1]
+    if measurement_x is None:
+        measurement_x = nx - 1
+    if not 0 <= measurement_x < nx:
+        raise ValueError(f"measurement_x must lie between 0 and {nx - 1}.")
+
+    # SciPy EDT is intentionally outside vmap.
+    contact_masks = jnp.stack([
+        build_contact_mask(s, contact_distance_cells=contact_distance_cells)
+        for s in np.asarray(solids)
+    ])
+
+    def one(velocity, solid, contact_mask):
+        return _run_tracer_scan_with_contact(
+            velocity,
+            solid,
+            contact_mask,
+            number_of_steps=number_of_steps,
+            pulse_duration=pulse_duration,
+            inlet_concentration=inlet_concentration,
+            diffusivity=diffusivity,
+            dt=dt,
+            measurement_x=measurement_x,
+            sample_every=sample_every,
+        )
+
+    outputs = jax.jit(jax.vmap(one, in_axes=(0, 0, 0)))(
+        velocities, solids, contact_masks
+    )
+    outputs = jax.tree.map(lambda value: value.block_until_ready(), outputs)
+
+    results = []
+    for i in range(velocities.shape[0]):
+        values = jax.tree.map(lambda value: value[i], outputs)
+        (
+            final_concentration,
+            final_contact_age,
+            final_contact_age_squared,
+            outlet_mass_flux,
+            outlet_contact_age_flux,
+            outlet_contact_age_squared_flux,
+            outlet_mean_concentration,
+            tracer_mass,
+            contact_region_tracer_mass,
+            cumulative_injected_mass,
+            cumulative_outlet_mass,
+            cumulative_surface_exposure,
+            mass_balance_error,
+        ) = values
+
+        outlet_mass_flux_np = np.asarray(outlet_mass_flux)
+        outlet_contact_age_flux_np = np.asarray(outlet_contact_age_flux)
+        outlet_contact_age_squared_flux_np = np.asarray(outlet_contact_age_squared_flux)
+        sampled_dt = dt * sample_every
+
+        total_measured_outlet_mass = np.sum(outlet_mass_flux_np) * sampled_dt
+        total_measured_contact_age = np.sum(outlet_contact_age_flux_np) * sampled_dt
+        total_measured_contact_age_squared = (
+            np.sum(outlet_contact_age_squared_flux_np) * sampled_dt
+        )
+
+        mean_exited_contact_time = (
+            total_measured_contact_age / max(total_measured_outlet_mass, 1.0e-12)
+        )
+        mean_exited_contact_time_squared = (
+            total_measured_contact_age_squared
+            / max(total_measured_outlet_mass, 1.0e-12)
+        )
+        contact_time_variance = max(
+            mean_exited_contact_time_squared - mean_exited_contact_time**2, 0.0
+        )
+        contact_time_standard_deviation = float(np.sqrt(contact_time_variance))
+        contact_time_coefficient_of_variation = (
+            contact_time_standard_deviation / max(mean_exited_contact_time, 1.0e-12)
+        )
+
+        outlet_mean_contact_time = np.divide(
+            outlet_contact_age_flux_np,
+            outlet_mass_flux_np,
+            out=np.zeros_like(outlet_contact_age_flux_np, dtype=float),
+            where=outlet_mass_flux_np > 1.0e-12,
+        )
+        outlet_mean_contact_time_squared = np.divide(
+            outlet_contact_age_squared_flux_np,
+            outlet_mass_flux_np,
+            out=np.zeros_like(outlet_contact_age_squared_flux_np, dtype=float),
+            where=outlet_mass_flux_np > 1.0e-12,
+        )
+        outlet_contact_time_standard_deviation = np.sqrt(
+            np.maximum(
+                outlet_mean_contact_time_squared - outlet_mean_contact_time**2,
+                0.0,
+            )
+        )
+
+        residence_statistics = residence_time_statistics(
+            outlet_mass_flux_np, dt=dt, sample_every=sample_every
+        )
+        mean_residence_time = float(residence_statistics["mean"])
+        residence_time_standard_deviation = float(
+            residence_statistics["standard_deviation"]
+        )
+        residence_time_coefficient_of_variation = float(
+            residence_statistics["coefficient_of_variation"]
+        )
+        residence_time_skewness = float(residence_statistics["skewness"])
+        residence_time_peak = float(residence_statistics["peak_time"])
+        total_outlet_mass = float(residence_statistics["total_outlet_mass"])
+
+        contact_fraction = (
+            mean_exited_contact_time / max(mean_residence_time, 1.0e-12)
+        )
+        score = (
+            contact_fraction
+            - score_penalty_weight * contact_time_coefficient_of_variation
+        )
+        surface_exposure = float(np.asarray(cumulative_surface_exposure)[-1])
+        final_injected_mass = float(np.asarray(cumulative_injected_mass)[-1])
+        mean_contact_time_per_injected_mass = (
+            surface_exposure / max(final_injected_mass, 1.0e-12)
+        )
+
+        results.append(TracerResult(
+            concentration=final_concentration,
+            contact_age=final_contact_age,
+            contact_age_squared=final_contact_age_squared,
+            contact_mask=contact_masks[i],
+            outlet_mass_flux=outlet_mass_flux_np,
+            outlet_contact_age_flux=outlet_contact_age_flux_np,
+            outlet_contact_age_squared_flux=outlet_contact_age_squared_flux_np,
+            outlet_mean_contact_time=outlet_mean_contact_time,
+            outlet_contact_time_standard_deviation=outlet_contact_time_standard_deviation,
+            outlet_mean_concentration=np.asarray(outlet_mean_concentration),
+            tracer_mass=np.asarray(tracer_mass),
+            contact_region_tracer_mass=np.asarray(contact_region_tracer_mass),
+            cumulative_injected_mass=np.asarray(cumulative_injected_mass),
+            cumulative_outlet_mass=np.asarray(cumulative_outlet_mass),
+            cumulative_surface_exposure=np.asarray(cumulative_surface_exposure),
+            mass_balance_error=np.asarray(mass_balance_error),
+            mean_exited_contact_time=float(mean_exited_contact_time),
+            contact_time_standard_deviation=contact_time_standard_deviation,
+            contact_time_coefficient_of_variation=float(
+                contact_time_coefficient_of_variation
+            ),
+            mean_contact_time_per_injected_mass=float(
+                mean_contact_time_per_injected_mass
+            ),
+            mean_residence_time=mean_residence_time,
+            residence_time_standard_deviation=residence_time_standard_deviation,
+            residence_time_coefficient_of_variation=(
+                residence_time_coefficient_of_variation
+            ),
+            residence_time_skewness=residence_time_skewness,
+            residence_time_peak=residence_time_peak,
+            total_outlet_mass=total_outlet_mass,
+            contact_fraction=float(contact_fraction),
+            surface_exposure=surface_exposure,
+            score=float(score),
+            score_penalty_weight=float(score_penalty_weight),
+            contact_distance_cells=float(contact_distance_cells),
+            sample_every=sample_every,
+            dt=dt,
+            measurement_x=measurement_x,
+        ))
+
+    return results
+
+
 def residence_time_statistics(
     outlet_mass_flux: np.ndarray,
     *,
