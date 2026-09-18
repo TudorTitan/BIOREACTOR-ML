@@ -10,7 +10,7 @@ import numpy as np
 
 from src.fluid import macroscopic_fields, run_steps
 from src.model import CONFIG, grid as DEFAULT_GRID, init_fluid, init_geometry, warm_start_new_geometry
-from src.tracer import run_tracer_experiment
+from src.tracer import run_tracer_experiment, run_tracer_experiments_batch
 
 DIRECTIONS_8 = ((-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1))
 
@@ -133,14 +133,17 @@ def _simplex_params(a, b):
     return {'A': float(a), 'B': float(b), 'C': float(1.0-a-b)}
 
 def grid_search(start_params, n_steps=10, grid=DEFAULT_GRID, step_size=0.1, batch_size=2,
-                show_progress=True, **kwargs):
+                tracer_batch_size=8, show_progress=True, **kwargs):
     """Greedy cached 8-neighbour search on the non-negative A+B+C=1 simplex.
 
     Unseen neighbours are evaluated in CFD chunks of at most batch_size
-    geometries. Tracer experiments remain sequential.
+    geometries, then tracer experiments are evaluated in chunks of at most
+    tracer_batch_size geometries.
     """
     if batch_size < 1:
         raise ValueError('batch_size must be at least 1')
+    if tracer_batch_size < 1:
+        raise ValueError('tracer_batch_size must be at least 1')
 
     total = float(sum(start_params[k] for k in ('A','B','C')))
     if total <= 0:
@@ -176,6 +179,9 @@ def grid_search(start_params, n_steps=10, grid=DEFAULT_GRID, step_size=0.1, batc
         if unseen:
             warm = {'distributions': current.cfd.distributions, 'solid': current.cfd.solid}
             measurement_x = grid.nx - CONFIG['outlet_buffer_cells'] - 2
+            pending_cfd = {}
+
+            # CFD is chunked independently because it is the VRAM-heavy stage.
             for batch_start in range(0, len(unseen), batch_size):
                 batch_candidates = unseen[batch_start:batch_start + batch_size]
                 if show_progress:
@@ -191,23 +197,51 @@ def grid_search(start_params, n_steps=10, grid=DEFAULT_GRID, step_size=0.1, batc
                     show_progress=show_progress,
                     **{k:v for k,v in kwargs.items() if k in cfd_keys}
                 )
-
                 for i, candidate in enumerate(batch_candidates):
-                    p = params_cache[candidate]
-                    tracer_index = batch_start + i
+                    pending_cfd[candidate] = CFDResult(
+                        batch.distributions[i], batch.solid[i], batch.velocity[i],
+                        batch.block_residuals[:,i], batch.converged[i]
+                    )
+
+            # Tracer has its own configurable batch size. The SciPy contact-mask
+            # preparation and final metric calculation stay outside vmap.
+            for tracer_start in range(0, len(unseen), tracer_batch_size):
+                tracer_candidates = unseen[tracer_start:tracer_start + tracer_batch_size]
+                if show_progress:
+                    tracer_batch_number = tracer_start // tracer_batch_size + 1
+                    number_of_tracer_batches = (
+                        len(unseen) + tracer_batch_size - 1
+                    ) // tracer_batch_size
+                    print(f"\nTracer batch {tracer_batch_number}/{number_of_tracer_batches} "
+                          f"({len(tracer_candidates)} geometries)", flush=True)
+
+                velocities = jnp.stack([
+                    pending_cfd[candidate].velocity for candidate in tracer_candidates
+                ])
+                solids = jnp.stack([
+                    pending_cfd[candidate].solid for candidate in tracer_candidates
+                ])
+                tracers = run_tracer_experiments_batch(
+                    velocities,
+                    solids,
+                    number_of_steps=kwargs.get('tracer_steps',100_000),
+                    pulse_duration=kwargs.get('pulse_duration',200),
+                    inlet_concentration=1.0,
+                    diffusivity=kwargs.get('diffusivity',0.01),
+                    dt=kwargs.get('dt',1.0),
+                    measurement_x=measurement_x,
+                    contact_distance_cells=kwargs.get('contact_distance_cells',2.0),
+                    score_penalty_weight=kwargs.get('score_penalty_weight',0.5),
+                )
+
+                for candidate, tracer in zip(tracer_candidates, tracers):
+                    cache[candidate] = ExperimentResult(
+                        pending_cfd[candidate], tracer
+                    )
                     if show_progress:
-                        print(f"Tracer {_bar(tracer_index, len(unseen))} {tracer_index+1}/{len(unseen)} | "
-                              f"A={p['A']:.4f}, B={p['B']:.4f}, C={p['C']:.4f}", flush=True)
-                    tracer = run_tracer_experiment(batch.velocity[i], batch.solid[i],
-                        number_of_steps=kwargs.get('tracer_steps',100_000), pulse_duration=kwargs.get('pulse_duration',200),
-                        inlet_concentration=1.0, diffusivity=kwargs.get('diffusivity',0.01), dt=kwargs.get('dt',1.0),
-                        measurement_x=measurement_x, contact_distance_cells=kwargs.get('contact_distance_cells',2.0),
-                        score_penalty_weight=kwargs.get('score_penalty_weight',0.5), print_summary=False)
-                    cfd = CFDResult(batch.distributions[i], batch.solid[i], batch.velocity[i],
-                                    batch.block_residuals[:,i], batch.converged[i])
-                    cache[candidate] = ExperimentResult(cfd, tracer)
-                    if show_progress:
-                        print(f"       score={tracer.score:.6f}", flush=True)
+                        p = params_cache[candidate]
+                        print(f"  A={p['A']:.4f}, B={p['B']:.4f}, C={p['C']:.4f} "
+                              f"| score={tracer.score:.6f}", flush=True)
         if not valid:
             if show_progress:
                 print("No valid neighbours; stopping.", flush=True)
