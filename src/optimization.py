@@ -132,6 +132,52 @@ def run_experiment(params, *, warm_start=None, grid=DEFAULT_GRID, tracer_steps=1
 def _simplex_params(a, b):
     return {'A': float(a), 'B': float(b), 'C': float(1.0-a-b)}
 
+
+def _contact_statistics(tracer):
+    """Mean and variance of contact fraction for an evaluated geometry.
+
+    Contact fraction is contact time divided by residence time. We use the
+    mean residence time as the common normalization, so the variance is the
+    exited contact-time variance divided by mean_residence_time**2.
+    """
+    residence = max(float(tracer.mean_residence_time), 1.0e-12)
+    mean = float(tracer.contact_fraction)
+    variance = (float(tracer.contact_time_standard_deviation) / residence) ** 2
+    return mean, variance
+
+
+def _efficient_frontier(observations):
+    """Pareto frontier: maximize contact-fraction mean, minimize variance."""
+    frontier = []
+    for point in observations:
+        dominated = any(
+            other is not point
+            and other['contact_fraction_mean'] >= point['contact_fraction_mean']
+            and other['contact_fraction_variance'] <= point['contact_fraction_variance']
+            and (
+                other['contact_fraction_mean'] > point['contact_fraction_mean']
+                or other['contact_fraction_variance'] < point['contact_fraction_variance']
+            )
+            for other in observations
+        )
+        if not dominated:
+            frontier.append(point)
+    return sorted(frontier, key=lambda p: p['contact_fraction_variance'])
+
+
+def _observation(candidate, params, result):
+    mean, variance = _contact_statistics(result.tracer)
+    return {
+        'key': candidate,
+        'params': dict(params),
+        'score': float(result.score),
+        'contact_fraction_mean': mean,
+        'contact_fraction_variance': variance,
+        'contact_fraction_standard_deviation': float(np.sqrt(variance)),
+        'mean_residence_time': float(result.tracer.mean_residence_time),
+        'mean_exited_contact_time': float(result.tracer.mean_exited_contact_time),
+    }
+
 def grid_search(start_params, n_steps=10, grid=DEFAULT_GRID, step_size=0.1, batch_size=2,
                 tracer_batch_size=8, show_progress=True, **kwargs):
     """Greedy cached 8-neighbour search on the non-negative A+B+C=1 simplex.
@@ -159,6 +205,7 @@ def grid_search(start_params, n_steps=10, grid=DEFAULT_GRID, step_size=0.1, batc
     # their scalar score and parameters, never their device arrays.
     score_cache = {key: current.score}
     params_cache = {key: start}
+    observations = {key: _observation(key, start, current)}
     history = [(start, current.score)]
     cfd_keys = {'number_of_blocks','steps_per_block','residual_tolerance','require_residual_increase'}
 
@@ -254,6 +301,9 @@ def grid_search(start_params, n_steps=10, grid=DEFAULT_GRID, step_size=0.1, batc
                     result = ExperimentResult(pending_cfd[candidate], tracer)
                     step_results[candidate] = result
                     score_cache[candidate] = result.score
+                    observations[candidate] = _observation(
+                        candidate, params_cache[candidate], result
+                    )
                     if show_progress:
                         p = params_cache[candidate]
                         print(f"  A={p['A']:.4f}, B={p['B']:.4f}, C={p['C']:.4f} "
@@ -299,13 +349,22 @@ def grid_search(start_params, n_steps=10, grid=DEFAULT_GRID, step_size=0.1, batc
         print(f"\n=== Grid search complete ===\nBest: A={p['A']:.4f}, B={p['B']:.4f}, C={p['C']:.4f} | score={current.score:.6f}", flush=True)
 
     cache = {
-        candidate: {'params': params_cache[candidate], 'score': score}
+        candidate: {
+            'params': params_cache[candidate],
+            'score': score,
+            'contact_fraction_mean': observations[candidate]['contact_fraction_mean'],
+            'contact_fraction_variance': observations[candidate]['contact_fraction_variance'],
+        }
         for candidate, score in score_cache.items()
     }
+    observation_list = list(observations.values())
+    frontier = _efficient_frontier(observation_list)
     return {
         'params': params_cache[key],
         'score': current.score,
         'result': current,
         'history': history,
         'cache': cache,
+        'contact_observations': observation_list,
+        'efficient_frontier': frontier,
     }
