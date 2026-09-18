@@ -132,8 +132,16 @@ def run_experiment(params, *, warm_start=None, grid=DEFAULT_GRID, tracer_steps=1
 def _simplex_params(a, b):
     return {'A': float(a), 'B': float(b), 'C': float(1.0-a-b)}
 
-def grid_search(start_params, n_steps=10, grid=DEFAULT_GRID, step_size=0.1, show_progress=True, **kwargs):
-    """Greedy cached 8-neighbour search on the non-negative A+B+C=1 simplex."""
+def grid_search(start_params, n_steps=10, grid=DEFAULT_GRID, step_size=0.1, batch_size=2,
+                show_progress=True, **kwargs):
+    """Greedy cached 8-neighbour search on the non-negative A+B+C=1 simplex.
+
+    Unseen neighbours are evaluated in CFD chunks of at most batch_size
+    geometries. Tracer experiments remain sequential.
+    """
+    if batch_size < 1:
+        raise ValueError('batch_size must be at least 1')
+
     total = float(sum(start_params[k] for k in ('A','B','C')))
     if total <= 0:
         raise ValueError('A+B+C must be positive')
@@ -167,24 +175,39 @@ def grid_search(start_params, n_steps=10, grid=DEFAULT_GRID, step_size=0.1, show
                 print(f"  -> A={p['A']:.4f}, B={p['B']:.4f}, C={p['C']:.4f}", flush=True)
         if unseen:
             warm = {'distributions': current.cfd.distributions, 'solid': current.cfd.solid}
-            batch = run_cfd_batch([params_cache[c] for c in unseen], warm_start=warm, grid=grid,
-                                  show_progress=show_progress,
-                                  **{k:v for k,v in kwargs.items() if k in cfd_keys})
             measurement_x = grid.nx - CONFIG['outlet_buffer_cells'] - 2
-            for i, candidate in enumerate(unseen):
-                p = params_cache[candidate]
+            for batch_start in range(0, len(unseen), batch_size):
+                batch_candidates = unseen[batch_start:batch_start + batch_size]
                 if show_progress:
-                    print(f"Tracer {_bar(i, len(unseen))} {i+1}/{len(unseen)} | "
-                          f"A={p['A']:.4f}, B={p['B']:.4f}, C={p['C']:.4f}", flush=True)
-                tracer = run_tracer_experiment(batch.velocity[i], batch.solid[i],
-                    number_of_steps=kwargs.get('tracer_steps',100_000), pulse_duration=kwargs.get('pulse_duration',200),
-                    inlet_concentration=1.0, diffusivity=kwargs.get('diffusivity',0.01), dt=kwargs.get('dt',1.0),
-                    measurement_x=measurement_x, contact_distance_cells=kwargs.get('contact_distance_cells',2.0),
-                    score_penalty_weight=kwargs.get('score_penalty_weight',0.5), print_summary=False)
-                cfd = CFDResult(batch.distributions[i], batch.solid[i], batch.velocity[i], batch.block_residuals[:,i], batch.converged[i])
-                cache[candidate] = ExperimentResult(cfd, tracer)
-                if show_progress:
-                    print(f"       score={tracer.score:.6f}", flush=True)
+                    batch_number = batch_start // batch_size + 1
+                    number_of_batches = (len(unseen) + batch_size - 1) // batch_size
+                    print(f"\nCFD neighbour batch {batch_number}/{number_of_batches} "
+                          f"({len(batch_candidates)} geometries)", flush=True)
+
+                batch = run_cfd_batch(
+                    [params_cache[c] for c in batch_candidates],
+                    warm_start=warm,
+                    grid=grid,
+                    show_progress=show_progress,
+                    **{k:v for k,v in kwargs.items() if k in cfd_keys}
+                )
+
+                for i, candidate in enumerate(batch_candidates):
+                    p = params_cache[candidate]
+                    tracer_index = batch_start + i
+                    if show_progress:
+                        print(f"Tracer {_bar(tracer_index, len(unseen))} {tracer_index+1}/{len(unseen)} | "
+                              f"A={p['A']:.4f}, B={p['B']:.4f}, C={p['C']:.4f}", flush=True)
+                    tracer = run_tracer_experiment(batch.velocity[i], batch.solid[i],
+                        number_of_steps=kwargs.get('tracer_steps',100_000), pulse_duration=kwargs.get('pulse_duration',200),
+                        inlet_concentration=1.0, diffusivity=kwargs.get('diffusivity',0.01), dt=kwargs.get('dt',1.0),
+                        measurement_x=measurement_x, contact_distance_cells=kwargs.get('contact_distance_cells',2.0),
+                        score_penalty_weight=kwargs.get('score_penalty_weight',0.5), print_summary=False)
+                    cfd = CFDResult(batch.distributions[i], batch.solid[i], batch.velocity[i],
+                                    batch.block_residuals[:,i], batch.converged[i])
+                    cache[candidate] = ExperimentResult(cfd, tracer)
+                    if show_progress:
+                        print(f"       score={tracer.score:.6f}", flush=True)
         if not valid:
             if show_progress:
                 print("No valid neighbours; stopping.", flush=True)
